@@ -1,0 +1,580 @@
+# frozen_string_literal: true
+
+class ActivityPub::ProcessAccountService < BaseService
+  include JsonLdHelper
+  include DomainControlHelper
+  include Redisable
+  include Lockable
+
+  MAX_PUBLIC_KEYS = 10
+  MAX_PROFILE_FIELDS = 50
+  SUBDOMAINS_RATELIMIT = 10
+  DISCOVERIES_PER_REQUEST = 400
+
+  PROCESSING_DELAY = (30.seconds)..(10.minutes)
+  VERIFY_DELAY = 10.minutes
+
+  VALID_URI_SCHEMES = %w(http https).freeze
+
+  class Error < StandardError; end
+
+  # It is the caller's responsibility to check that `json` is indeed from the origin matching `json['id']`
+  def call(json, request_id: nil, only_key: false, signed_with_known_key: false, account: nil, suppress_errors: true)
+    raise Error, "Actor #{json['id']} has unsupported URI scheme" if unsupported_uri_scheme?(json['id'])
+    raise Error, "Actor #{json['id']} has no inbox" if json['inbox'].blank?
+    raise Error, "Actor #{json['id']} does not correspond to provided Account (#{account.uri})" if account.present? && account.uri != json['id']
+    return if domain_not_allowed?(json['id']) || account&.local?
+
+    @json        = json
+    @uri         = @json['id']
+    @account     = account
+    @only_key    = only_key
+    @webfinger_verified = false
+
+    extract_username_and_domain!
+
+    @domain = TagManager.instance.normalize_domain(@domain)
+    return if @account.nil? && domain_not_allowed?(@domain)
+
+    @collections = {}
+
+    # The key does not need to be unguessable, it just needs to be somewhat unique
+    @request_id = request_id || "#{Time.now.utc.to_i}-#{@username}@#{@domain}"
+
+    with_redis_lock("process_account:#{@uri}") do
+      # Now that Mastodon supports renaming accounts, assume URI is the most
+      # stable/trustworthy identifier.
+      @account ||= Account.remote.find_by(uri: @uri) # rubocop:disable Rails/FindByOrAssignmentMemoization
+
+      # `only_key` is used to update an existing account known by its `uri`.
+      # Lookup by handle and new account creation do not make sense in this case.
+      return if @account.nil? && @only_key
+
+      # Allow accounts to change URIs if they keep the same handle
+      # (typically, losing database or switching ActivityPub server implementation)
+      @account ||= Account.find_remote(@username, @domain) if @webfinger_verified
+
+      @old_public_keys = @account.present? ? (@account.keypairs.pluck(:public_key) + [@account.public_key.presence].compact) : []
+      @old_protocol = @account&.protocol
+      @suspension_changed = false
+      @uri_changed = @account.present? && @account.uri != @uri
+
+      if @account.nil?
+        with_redis do |redis|
+          return nil if redis.pfcount("unique_subdomains_for:#{PublicSuffix.domain(@domain, ignore_private: true)}") >= SUBDOMAINS_RATELIMIT
+
+          discoveries = redis.incr("discovery_per_request:#{@request_id}")
+          redis.expire("discovery_per_request:#{@request_id}", 5.minutes.seconds)
+          return nil if discoveries > DISCOVERIES_PER_REQUEST
+        end
+
+        create_account
+      elsif @webfinger_verified
+        # The user has potentially changed handle, update it
+        rename_account!
+      end
+
+      update_account
+      process_tags
+
+      # NOTE: while this case is unlikely due to the `rename_account!` above,
+      # we do not have a uniqueness constraint on URI, so this still needs to run
+      process_duplicate_accounts! if @webfinger_verified
+    end
+
+    after_protocol_change! if protocol_changed?
+    after_identity_change! if @uri_changed || (!signed_with_known_key && all_public_keys_changed?)
+
+    # TODO: maybe tie tombstones to specific keys? i.e. we don't need to keep tombstones if all keys changed
+    clear_tombstones! if all_public_keys_changed?
+    after_suspension_change! if suspension_changed?
+
+    unless @only_key || @account.suspended?
+      check_featured_collection! if @json['featured'].present?
+      check_featured_tags_collection! if @json['featuredTags'].present?
+      check_featured_collections_collection! if @json['featuredCollections'].present?
+      check_links! if @account.fields.any?(&:requires_verification?)
+    end
+
+    @account
+  rescue JSON::ParserError => e
+    raise Error, "Error parsing JSON for actor #{json['id']}: #{e}" unless suppress_errors
+  rescue Error
+    raise unless suppress_errors
+  end
+
+  private
+
+  def rename_account!
+    raise 'Attempting to rename an account without having verified its webfinger handle' unless @webfinger_verified
+
+    begin
+      # This will be a no-op if the username and domain haven't changed
+      @account.update!(username: @username, domain: @domain)
+    rescue ActiveRecord::RecordInvalid, ActiveRecord::RecordNotUnique
+      # This account (identified by ActivityPub `id`) is being renamed to a handle that was
+      # previously known by this Mastodon server as a different account…
+
+      rename_conflicting_account!
+
+      retry
+    end
+  end
+
+  def rename_conflicting_account!
+    conflicting_account = Account.find_remote(@username, @domain)
+    return if conflicting_account.nil? || conflicting_account.local? || conflicting_account.uri == @account.uri
+
+    conflicting_account.invalidate_username!
+
+    AccountRefreshWorker.perform_async(conflicting_account.id, { 'request_id' => @request_id })
+  end
+
+  def extract_username_and_domain!
+    # FEP-2c59 defines a `webfinger` attribute that makes things more explicit and spares an extra request in some cases.
+    # It supersedes `preferredUsername`.
+    @username, @domain = split_acct(@json['webfinger']) if @json['webfinger'].present? && @json['webfinger'].is_a?(String)
+
+    if @username.blank? || @domain.blank?
+      raise Error, "Actor #{@uri} has no `preferredUsername`, and either a bogus or missing `webfinger`, which is a requirement for Mastodon compatibility" if @json['preferredUsername'].blank?
+
+      Rails.logger.debug { "Actor #{@uri} has an invalid `webfinger` value, falling back to `preferredUsername`" } if @json['webfinger'].present?
+      @username = @json['preferredUsername']
+      @domain   = Addressable::URI.parse(@uri).normalized_host
+    end
+
+    if @account.present? && @username == @account.username && @domain == @account.domain
+      # This is an existing account whose handle has not changed, skip webfinger
+      @webfinger_verified = true
+    else
+      # This is either a new account, or an account whose handle has changed
+      check_webfinger! unless @only_key
+    end
+  end
+
+  def check_webfinger!
+    webfinger = Webfinger.new("acct:#{@username}@#{@domain}").perform
+    confirmed_username, confirmed_domain = split_acct(webfinger.subject)
+
+    raise Error, "Unsupported username format in webfinger response for #{@username}@#{@domain}" unless Account::USERNAME_ONLY_RE.match?(confirmed_username)
+
+    if @username.casecmp(confirmed_username).zero? && @domain.casecmp(confirmed_domain).zero?
+      raise Error, "Webfinger response for #{@username}@#{@domain} does not loop back to #{@uri}" if webfinger.self_link_href != @uri
+
+      @webfinger_verified = true
+
+      return
+    end
+
+    webfinger = Webfinger.new("acct:#{confirmed_username}@#{confirmed_domain}").perform
+    @username, @domain = split_acct(webfinger.subject)
+
+    raise Webfinger::RedirectError, "Too many webfinger redirects for URI #{@uri} (stopped at #{@username}@#{@domain})" unless confirmed_username.casecmp(@username).zero? && confirmed_domain.casecmp(@domain).zero?
+    raise Error, "Webfinger response for #{@username}@#{@domain} does not loop back to #{@uri}" if webfinger.self_link_href != @uri
+    raise Error, "Unsupported username format in webfinger response for #{@username}@#{@domain}" unless Account::USERNAME_ONLY_RE.match?(@username)
+
+    @webfinger_verified = true
+  rescue Webfinger::RedirectError => e
+    raise Error, e.message
+  rescue Webfinger::Error => e
+    raise Error, "Webfinger error when resolving #{@username}@#{@domain}: #{e.message}"
+  end
+
+  def split_acct(acct)
+    acct.delete_prefix('acct:').split('@')
+  end
+
+  def create_account
+    raise 'Attempting to create an account without having verified its webfinger handle' unless @webfinger_verified
+
+    @account = Account.new
+    @account.protocol          = :activitypub
+    @account.username          = @username
+    @account.domain            = @domain
+    @account.private_key       = nil
+    @account.suspended_at      = domain_block.created_at if auto_suspend?
+    @account.suspension_origin = :local if auto_suspend?
+    @account.silenced_at       = domain_block.created_at if auto_silence?
+
+    set_immediate_protocol_attributes!
+
+    @account.save!
+  end
+
+  def update_account
+    # NOTE: `last_webfingered_at` is a misnomer, it is meant to record when
+    # the profile has last been fully updated, which was historically tied to webfinger queries.
+    # Hence why we use `@only_key` and not `@webfinger_verified`
+    @account.last_webfingered_at = Time.now.utc unless @only_key
+    @account.protocol            = :activitypub
+
+    set_suspension!
+    set_immediate_protocol_attributes!
+    set_fetchable_key! unless @account.suspended? && @account.suspension_origin_local?
+    set_immediate_attributes! unless @account.suspended?
+    set_fetchable_attributes! unless @only_key || @account.suspended?
+
+    @account.save_with_optional_media!
+  end
+
+  def set_immediate_protocol_attributes!
+    @account.inbox_url               = valid_collection_uri(@json['inbox'])
+    @account.outbox_url              = valid_collection_uri(@json['outbox'])
+    @account.shared_inbox_url        = valid_collection_uri(@json['endpoints'].is_a?(Hash) ? @json['endpoints']['sharedInbox'] : @json['sharedInbox'])
+    @account.followers_url           = valid_collection_uri(@json['followers'])
+    @account.following_url           = valid_collection_uri(@json['following'])
+    @account.url                     = url || @uri
+    @account.uri                     = @uri
+    @account.actor_type              = actor_type
+    @account.created_at              = @json['published'] if @json['published'].present?
+    @account.feature_approval_policy = feature_approval_policy
+  end
+
+  def valid_collection_uri(uri)
+    uri = uri.first if uri.is_a?(Array)
+    uri = uri['id'] if uri.is_a?(Hash)
+    return '' unless uri.is_a?(String)
+
+    parsed_uri = Addressable::URI.parse(uri)
+
+    VALID_URI_SCHEMES.include?(parsed_uri.scheme) && parsed_uri.host.present? ? parsed_uri : ''
+  rescue Addressable::URI::InvalidURIError
+    ''
+  end
+
+  def set_immediate_attributes!
+    @account.featured_collection_url = valid_collection_uri(@json['featured'])
+    @account.collections_url         = valid_collection_uri(@json['featuredCollections'])
+    @account.display_name            = (@json['name'] || '')[0...(Account::DISPLAY_NAME_LENGTH_HARD_LIMIT)]
+    @account.note                    = (@json['summary'] || '')[0...(Account::NOTE_LENGTH_HARD_LIMIT)]
+    @account.locked                  = @json['manuallyApprovesFollowers'] || false
+    @account.fields                  = property_values || {}
+    @account.also_known_as           = as_array(@json['alsoKnownAs'] || []).take(Account::ALSO_KNOWN_AS_HARD_LIMIT).map { |item| value_or_id(item) }
+    @account.discoverable            = @json['discoverable'] || false
+    @account.indexable               = @json['indexable'] || false
+    @account.memorial                = @json['memorial'] || false
+    @account.show_featured           = @json['showFeatured'] if @json.key?('showFeatured')
+    @account.show_media              = @json['showMedia'] if @json.key?('showMedia')
+    @account.show_media_replies      = @json['showRepliesInMedia'] if @json.key?('showRepliesInMedia')
+    @account.attribution_domains     = as_array(@json['attributionDomains'] || []).take(Account::ATTRIBUTION_DOMAINS_HARD_LIMIT).grep(String)
+  end
+
+  def set_fetchable_key!
+    @account.keypairs.upsert_all(public_keys, unique_by: :uri)
+    @account.keypairs.where.not(uri: public_keys.pluck(:uri)).delete_all
+
+    # Unset legacy public key attribute
+    @account.public_key = ''
+  end
+
+  def set_fetchable_attributes!
+    begin
+      avatar_url, avatar_description = image_url_and_description('icon')
+      @account.avatar_remote_url = avatar_url || '' unless skip_download?
+      @account.avatar = nil if @account.avatar_remote_url.blank?
+      @account.avatar_description = avatar_description || ''
+    rescue Mastodon::UnexpectedResponseError, *Mastodon::HTTP_CONNECTION_ERRORS
+      RedownloadAvatarWorker.perform_in(rand(PROCESSING_DELAY), @account.id)
+    end
+    begin
+      header_url, header_description = image_url_and_description('image')
+      @account.header_remote_url = header_url || '' unless skip_download?
+      @account.header = nil if @account.header_remote_url.blank?
+      @account.header_description = header_description || ''
+    rescue Mastodon::UnexpectedResponseError, *Mastodon::HTTP_CONNECTION_ERRORS
+      RedownloadHeaderWorker.perform_in(rand(PROCESSING_DELAY), @account.id)
+    end
+    @account.statuses_count    = outbox_total_items    if outbox_total_items.present?
+    @account.following_count   = following_total_items if following_total_items.present?
+    @account.followers_count   = followers_total_items if followers_total_items.present?
+    @account.hide_collections  = following_private? || followers_private?
+    @account.moved_to_account  = @json['movedTo'].present? ? moved_account : nil
+  end
+
+  def set_suspension!
+    return if @account.suspended? && @account.suspension_origin_local?
+
+    if @account.suspended? && !@json['suspended']
+      @account.unsuspend!
+      @suspension_changed = true
+    elsif !@account.suspended? && @json['suspended']
+      @account.suspend!(origin: :remote)
+      @suspension_changed = true
+    end
+  end
+
+  def after_protocol_change!
+    ActivityPub::PostUpgradeWorker.perform_async(@account.domain)
+  end
+
+  def after_identity_change!
+    RefollowWorker.perform_async(@account.id)
+  end
+
+  def after_suspension_change!
+    if @account.suspended?
+      Admin::SuspensionWorker.perform_async(@account.id)
+    else
+      Admin::UnsuspensionWorker.perform_async(@account.id)
+    end
+  end
+
+  def check_featured_collection!
+    ActivityPub::SynchronizeFeaturedCollectionWorker.perform_async(@account.id, { 'hashtag' => @json['featuredTags'].blank?, 'collection' => @json['featured'], 'request_id' => @request_id })
+  end
+
+  def check_featured_tags_collection!
+    ActivityPub::SynchronizeFeaturedTagsCollectionWorker.perform_async(@account.id, @json['featuredTags'])
+  end
+
+  def check_featured_collections_collection!
+    ActivityPub::SynchronizeFeaturedCollectionsCollectionWorker.perform_async(@account.id, @request_id)
+  end
+
+  def check_links!
+    VerifyAccountLinksWorker.perform_in(rand(VERIFY_DELAY), @account.id)
+  end
+
+  def process_duplicate_accounts!
+    return unless Account.where(uri: @account.uri).where.not(id: @account.id).exists?
+
+    AccountMergingWorker.perform_async(@account.id)
+  end
+
+  def actor_type
+    if @json['type'].is_a?(Array)
+      @json['type'].find { |type| ActivityPub::FetchRemoteAccountService::SUPPORTED_TYPES.include?(type) }
+    else
+      @json['type']
+    end
+  end
+
+  def image_url_and_description(key)
+    value = first_of_value(@json[key])
+
+    return if value.nil?
+
+    if value.is_a?(String)
+      value = fetch_resource_without_id_validation(value)
+      return if value.nil?
+    end
+
+    if value.is_a?(Hash) && value['type'] == 'Image'
+      url = first_of_value(value['url'])
+      url = url['href'] if url.is_a?(Hash)
+      description = first_lang_string(value, 'summary').presence || first_lang_string(value, 'name').presence
+      description = description.strip[0...MediaAttachment::MAX_DESCRIPTION_HARD_LENGTH_LIMIT] if description.present?
+    else
+      url = value
+    end
+
+    url = url['href'] if url.is_a?(Hash)
+
+    url = nil unless url.is_a?(String)
+    description = nil unless description.is_a?(String)
+
+    [url, description]
+  end
+
+  def public_keys
+    @public_keys ||= (fep_521a_public_keys + legacy_public_keys).uniq { |key| key[:uri] }
+  end
+
+  def legacy_public_keys
+    as_array(@json['publicKey']).take(MAX_PUBLIC_KEYS).filter_map do |value|
+      next if value.nil?
+
+      if value.is_a?(Hash)
+        next unless value['owner'] == @account.uri
+
+        key = value['publicKeyPem']
+        value = value['id']
+
+        # Key is contained within the actor document, no need to fetch anything else
+        next { type: :rsa, public_key: key, uri: value } if value.split('#').first == @account.uri
+      end
+
+      key_id = value
+
+      # Key is fetched without ID validation because of a GoToSocial bug
+      value = fetch_resource_without_id_validation(key_id)
+      next if value.blank?
+
+      # Special handling for GoToSocial which returns the whole actor for the key ID
+      value = first_of_value(value['publicKey']) if value.is_a?(Hash) && value.key?('publicKey')
+
+      next unless value['owner'] == @account.uri
+
+      key = value['publicKeyPem']
+      next if key.nil?
+
+      { type: :rsa, public_key: key, uri: key_id }
+    end
+  end
+
+  def fep_521a_public_keys
+    as_array(@json['assertionMethod']).take(MAX_PUBLIC_KEYS).filter_map do |value|
+      next if value.nil?
+
+      if value.is_a?(Hash)
+        next unless value['type'] == 'Multikey' && value['controller'] == @account.uri
+
+        key_type, key = key_from_multikey(value['publicKeyMultibase'])
+        next if key_type.nil?
+
+        value = value['id']
+
+        # Key is contained within the actor document, no need to fetch anything else
+        next { type: key_type, public_key: key, uri: value } if value.split('#').first == @account.uri
+      end
+
+      key_id = value
+
+      value = fetch_resource(key_id, true)
+
+      next unless value['type'] == 'Multikey' && value['controller'] == @account.uri
+
+      key_type, key = key_from_multikey(value['publicKeyMultibase'])
+      next if key_type.nil? || key.nil?
+
+      { type: key_type, public_key: key, uri: key_id }
+    end
+  end
+
+  def key_from_multikey(value)
+    Multibase.decode_key_to_pem(value)
+  rescue Multibase::Error
+    nil
+  end
+
+  def url
+    return if @json['url'].blank?
+
+    url_candidate = url_to_href(@json['url'], 'text/html')
+
+    if unsupported_uri_scheme?(url_candidate) || mismatching_origin?(url_candidate)
+      nil
+    else
+      url_candidate
+    end
+  end
+
+  def property_values
+    return unless @json['attachment'].is_a?(Array)
+
+    as_array(@json['attachment'])
+      .select { |attachment| attachment['type'] == 'PropertyValue' }
+      .take(MAX_PROFILE_FIELDS)
+      .map { |attachment| attachment.slice('name', 'value') }
+  end
+
+  def mismatching_origin?(url)
+    needle   = Addressable::URI.parse(url).host
+    haystack = Addressable::URI.parse(@uri).host
+
+    !haystack.casecmp(needle).zero?
+  end
+
+  def outbox_total_items
+    collection_info('outbox').first
+  end
+
+  def following_total_items
+    collection_info('following').first
+  end
+
+  def followers_total_items
+    collection_info('followers').first
+  end
+
+  def following_private?
+    !collection_info('following').last
+  end
+
+  def followers_private?
+    !collection_info('followers').last
+  end
+
+  def collection_info(type)
+    collection_uri = valid_collection_uri(@json[type])
+    return [nil, nil] if collection_uri.blank?
+    return @collections[type] if @collections.key?(type)
+
+    collection = fetch_resource_without_id_validation(collection_uri)
+
+    total_items = collection.is_a?(Hash) && collection['totalItems'].present? && collection['totalItems'].is_a?(Numeric) ? collection['totalItems'] : nil
+    has_first_page = collection.is_a?(Hash) && collection['first'].present?
+    @collections[type] = [total_items, has_first_page]
+  rescue *Mastodon::HTTP_CONNECTION_ERRORS, Mastodon::LengthValidationError
+    @collections[type] = [nil, nil]
+  end
+
+  def moved_account
+    account   = ActivityPub::TagManager.instance.uri_to_resource(@json['movedTo'], Account)
+    account ||= ActivityPub::FetchRemoteAccountService.new.call(@json['movedTo'], break_on_redirect: true, request_id: @request_id)
+    account
+  end
+
+  def skip_download?
+    @account.suspended? || domain_block&.reject_media?
+  end
+
+  def auto_suspend?
+    domain_block&.suspend?
+  end
+
+  def auto_silence?
+    domain_block&.silence?
+  end
+
+  def domain_block
+    return @domain_block if defined?(@domain_block)
+
+    @domain_block = DomainBlock.rule_for(@domain)
+  end
+
+  def all_public_keys_changed?
+    !@old_public_keys.empty? && @account.keypairs.none? { |keypair| keypair.usable? && @old_public_keys.include?(keypair.public_key) }
+  end
+
+  def suspension_changed?
+    @suspension_changed
+  end
+
+  def clear_tombstones!
+    Tombstone.where(account_id: @account.id).delete_all
+  end
+
+  def protocol_changed?
+    !@old_protocol.nil? && @old_protocol != @account.protocol
+  end
+
+  def process_tags
+    return if @json['tag'].blank?
+
+    as_array(@json['tag']).each do |tag|
+      process_emoji tag if equals_or_includes?(tag['type'], 'Emoji')
+    end
+  end
+
+  def process_emoji(tag)
+    return if skip_download?
+    return if tag['name'].blank? || tag['icon'].blank? || tag['icon']['url'].blank?
+
+    shortcode = tag['name'].delete(':')
+    image_url = tag['icon']['url']
+    uri       = tag['id']
+    updated   = tag['updated']
+    emoji     = CustomEmoji.find_by(shortcode: shortcode, domain: @account.domain)
+
+    return unless emoji.nil? || image_url != emoji.image_remote_url || (updated && updated >= emoji.updated_at)
+
+    emoji ||= CustomEmoji.new(domain: @account.domain, shortcode: shortcode, uri: uri)
+    emoji.image_remote_url = image_url
+    emoji.save
+  end
+
+  def feature_approval_policy
+    ActivityPub::Parser::InteractionPolicyParser.new(@json.dig('interactionPolicy', 'canFeature'), @account).bitmap
+  end
+end

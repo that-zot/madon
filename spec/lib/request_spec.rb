@@ -1,0 +1,297 @@
+# frozen_string_literal: true
+
+require 'rails_helper'
+require 'securerandom'
+
+RSpec.describe Request do
+  subject { described_class.new(:get, 'http://example.com', **options) }
+
+  let(:options) { {} }
+
+  describe '#headers' do
+    it 'returns user agent' do
+      expect(subject.headers['User-Agent']).to be_present
+    end
+
+    it 'returns the date header' do
+      expect(subject.headers['Date']).to be_present
+    end
+
+    it 'returns the host header' do
+      expect(subject.headers['Host']).to be_present
+    end
+
+    it 'does not return virtual request-target header' do
+      expect(subject.headers['(request-target)']).to be_nil
+    end
+  end
+
+  describe '#on_behalf_of' do
+    it 'when used, sets signing keypair' do
+      subject.on_behalf_of(Fabricate(:account))
+      expect(subject.signing_keypair).to be_present
+    end
+  end
+
+  describe '#add_headers' do
+    it 'adds headers to the request' do
+      subject.add_headers('Test' => 'Foo')
+      expect(subject.headers['Test']).to eq 'Foo'
+    end
+  end
+
+  describe '#initialize' do
+    subject { described_class.new(:get, url) }
+
+    context 'when URL has new lines' do
+      let(:url) { "https://host.example/image\nhttps://badhost.example/page.jpg" }
+
+      it 'encodes new lines in url value after normalization' do
+        expect(initialized_url_value)
+          .to eq('https://host.example/image%0Ahttps://badhost.example/page.jpg')
+      end
+    end
+
+    def initialized_url_value
+      subject.instance_variable_get(:@url).to_s
+    end
+  end
+
+  describe '#perform' do
+    context 'with valid host and non-persistent connection' do
+      before { stub_request(:get, 'http://example.com').to_return(body: 'lorem ipsum') }
+
+      it 'executes a HTTP request' do
+        expect { |block| subject.perform(&block) }.to yield_control
+        expect(a_request(:get, 'http://example.com')).to have_been_made.once
+      end
+
+      context 'when first address is private' do
+        let(:resolv_service) { instance_double(Resolv) }
+
+        before do
+          allow(Resolv).to receive(:new).and_return(resolv_service)
+          allow(resolv_service).to receive(:getaddresses).with('example.com').and_return(%w(0.0.0.0 2001:4860:4860::8844))
+        end
+
+        it 'executes a HTTP request' do
+          expect { |block| subject.perform(&block) }
+            .to yield_control
+          expect(a_request(:get, 'http://example.com'))
+            .to have_been_made.once
+        end
+      end
+
+      it 'makes a request with expected headers, yields, and closes the underlying connection' do
+        allow(subject.send(:http_client)).to receive(:close)
+
+        expect { |block| subject.perform(&block) }.to yield_control
+
+        expect(a_request(:get, 'http://example.com').with(headers: subject.headers)).to have_been_made
+        expect(subject.send(:http_client)).to have_received(:close)
+      end
+
+      it 'yields response' do
+        subject.perform do |response|
+          expect(response.body_with_limit).to eq 'lorem ipsum'
+        end
+      end
+    end
+
+    context 'with server that only supports RFC 9421' do
+      let(:account) { Fabricate(:account) }
+
+      before do
+        # cavage-12
+        stub_request(:get, 'http://example.com')
+          .with { |request| request.headers.key?('Signature') && !request.headers.key?('Signature-Input') }
+          .to_return(status: 401)
+
+        # RFC 9421
+        stub_request(:get, 'http://example.com')
+          .with { |request| request.headers.key?('Signature') && request.headers.key?('Signature-Input') }
+          .to_return(status: 200)
+      end
+
+      it 'makes two valid requests with the specific signatures' do
+        expect { |block| subject.on_behalf_of(account).perform(&block) }.to yield_control
+
+        # Makes a valid request using cavage-12
+        expect(a_request(:get, 'http://example.com').with { |request| verified_signed_mocked_request?(request, account.keypair) && !request.headers.key?('Signature-Input') })
+          .to have_been_made.once
+
+        # Makes a valid request using RFC 9421
+        expect(a_request(:get, 'http://example.com').with { |request| verified_signed_mocked_request?(request, account.keypair) && request.headers.key?('Signature-Input') })
+          .to have_been_made.once
+      end
+    end
+
+    context 'with a redirect and HTTP signatures' do
+      let(:account) { Fabricate(:account) }
+
+      before do
+        stub_request(:get, 'http://example.com').to_return(status: 301, headers: { Location: 'http://redirected.example.com/foo' })
+        stub_request(:get, 'http://redirected.example.com/foo').to_return(body: 'lorem ipsum')
+      end
+
+      it 'makes a request with expected headers and follows redirects' do
+        expect { |block| subject.on_behalf_of(account).perform(&block) }.to yield_control
+
+        # request.headers includes the `Signature` sent for the first request
+        expect(a_request(:get, 'http://example.com').with(headers: subject.headers.merge('Signature' => /.*/))).to have_been_made.once
+        expect(a_request(:get, 'http://example.com').with { |request| verified_signed_mocked_request?(request, account.keypair) }).to have_been_made.once
+
+        # This doesn't actually test that the signature has changed, but I verified this manually
+        expect(a_request(:get, 'http://redirected.example.com/foo').with(headers: subject.headers.merge({ 'Host' => 'redirected.example.com', 'Signature' => /.*/ }))).to have_been_made.once
+        expect(a_request(:get, 'http://redirected.example.com/foo').with { |request| verified_signed_mocked_request?(request, account.keypair) }).to have_been_made.once
+      end
+    end
+
+    context 'with private host' do
+      around do |example|
+        WebMock.disable!
+        example.run
+        WebMock.enable!
+      end
+
+      let(:resolv_service) { instance_double(Resolv) }
+
+      before do
+        allow(Resolv).to receive(:new).with([be_a(Resolv::Hosts), be_a(Resolv::DNS)]).and_return(resolv_service)
+        allow(resolv_service).to receive(:getaddresses).with('example.com').and_return(%w(0.0.0.0 2001:db8::face))
+      end
+
+      it 'raises Mastodon::ValidationError' do
+        expect { subject.perform }
+          .to raise_error Mastodon::ValidationError
+      end
+
+      context 'when the request is signed' do
+        it 'raises Mastodon::ValidationError' do
+          expect { subject.on_behalf_of(Fabricate(:account)).perform }
+            .to raise_error Mastodon::ValidationError
+        end
+
+        context 'when resolving changes between requests' do
+          # rubocop:disable RSpec/SubjectStub -- found no better way than this due to the WebMock interaction
+          before do
+            request =  instance_double(HTTP::Request)
+            connection = instance_double(HTTP::Connection)
+            allow(subject).to receive(:perform_cavage_signed_request).and_return(HTTP::Response.new(status: 401, version: '1.1', connection:, request:))
+          end
+
+          it 'performs the first request and raises Mastodon::ValidationError on the second' do
+            expect { subject.on_behalf_of(Fabricate(:account)).perform }
+              .to raise_error Mastodon::ValidationError
+
+            expect(subject).to have_received(:perform_cavage_signed_request).once
+          end
+          # rubocop:enable RSpec/SubjectStub
+        end
+      end
+    end
+
+    context 'with persistent connection' do
+      before { stub_request(:get, 'http://example.com').to_return(body: SecureRandom.random_bytes(2.megabytes)) }
+
+      let(:http_client) { described_class.http_client.persistent('http://example.com') }
+      let(:options) { { http_client: http_client } }
+
+      it 'leaves connection open after completely consumed response' do
+        allow(http_client).to receive(:close)
+
+        subject.perform { |response| response.truncated_body(3.megabytes) }
+
+        expect(http_client).to_not have_received(:close)
+      end
+
+      it 'leaves connection open after nearly consumed response' do
+        allow(http_client).to receive(:close)
+
+        subject.perform { |response| response.truncated_body(1.8.megabytes) }
+
+        expect(http_client).to_not have_received(:close)
+      end
+
+      it 'closes connection after unconsumed response' do
+        allow(http_client).to receive(:close)
+
+        subject.perform
+
+        expect(http_client).to have_received(:close)
+      end
+
+      it 'yields response' do
+        subject.perform do |response|
+          expect(response.body_with_limit(2.megabytes).size).to eq 2.megabytes
+        end
+      end
+    end
+  end
+
+  describe "response's body_with_limit method" do
+    it 'rejects body more than 1 megabyte by default' do
+      stub_request(:any, 'http://example.com').to_return(body: SecureRandom.random_bytes(2.megabytes))
+      expect { subject.perform(&:body_with_limit) }.to raise_error(Mastodon::LengthValidationError, 'Body size exceeds limit of 1048576')
+    end
+
+    it 'accepts body less than 1 megabyte by default' do
+      stub_request(:any, 'http://example.com').to_return(body: SecureRandom.random_bytes(2.kilobytes))
+      expect { subject.perform(&:body_with_limit) }.to_not raise_error
+    end
+
+    it 'rejects body by given size' do
+      stub_request(:any, 'http://example.com').to_return(body: SecureRandom.random_bytes(2.kilobytes))
+      expect { subject.perform { |response| response.body_with_limit(1.kilobyte) } }.to raise_error(Mastodon::LengthValidationError, 'Body size exceeds limit of 1024')
+    end
+
+    it 'rejects too large chunked body' do
+      stub_request(:any, 'http://example.com').to_return(body: SecureRandom.random_bytes(2.megabytes), headers: { 'Transfer-Encoding' => 'chunked' })
+      expect { subject.perform(&:body_with_limit) }.to raise_error(Mastodon::LengthValidationError, 'Body size exceeds limit of 1048576')
+    end
+
+    it 'rejects too large monolithic body' do
+      stub_request(:any, 'http://example.com').to_return(body: SecureRandom.random_bytes(2.megabytes), headers: { 'Content-Length' => 2.megabytes })
+      expect { subject.perform(&:body_with_limit) }.to raise_error(Mastodon::LengthValidationError, 'Content-Length 2097152 exceeds limit of 1048576')
+    end
+
+    it 'truncates large monolithic body' do
+      stub_request(:any, 'http://example.com').to_return(body: SecureRandom.random_bytes(2.megabytes), headers: { 'Content-Length' => 2.megabytes })
+      expect(subject.perform { |response| response.truncated_body.bytesize }).to be < 2.megabytes
+    end
+
+    it 'uses binary encoding if Content-Type does not tell encoding' do
+      stub_request(:any, 'http://example.com').to_return(body: '', headers: { 'Content-Type' => 'text/html' })
+      expect(subject.perform { |response| response.body_with_limit.encoding }).to eq Encoding::BINARY
+    end
+
+    it 'uses binary encoding if Content-Type tells unknown encoding' do
+      stub_request(:any, 'http://example.com').to_return(body: '', headers: { 'Content-Type' => 'text/html; charset=unknown' })
+      expect(subject.perform { |response| response.body_with_limit.encoding }).to eq Encoding::BINARY
+    end
+
+    it 'uses encoding specified by Content-Type' do
+      stub_request(:any, 'http://example.com').to_return(body: '', headers: { 'Content-Type' => 'text/html; charset=UTF-8' })
+      expect(subject.perform { |response| response.body_with_limit.encoding }).to eq Encoding::UTF_8
+    end
+  end
+
+  def verified_signed_mocked_request?(webmock_request, keypair)
+    # Webmock requests are rather barebones and our signature verification
+    # code works with `ActionDispatch::Request` objects.
+
+    # This method builds a test request from the webmock request first,
+    # but this currently does not cover requests with bodies.
+    # A better way would probably be to build a whole Rack env, but
+    # that code was a lot more straightforward, and sufficient for
+    # the added test.
+
+    request = ActionDispatch::TestRequest.create
+    request.request_uri = webmock_request.uri
+    request.path = webmock_request.uri.path
+    request.request_method = webmock_request.method
+    request.headers.merge!(webmock_request.headers)
+
+    SignedRequest.new(request).verified?(keypair)
+  end
+end
