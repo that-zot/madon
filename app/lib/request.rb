@@ -1,0 +1,410 @@
+# frozen_string_literal: true
+
+require 'ipaddr'
+require 'socket'
+require 'resolv'
+
+# Use our own timeout class to avoid using HTTP.rb's timeout block
+# around the Socket#open method, since we use our own timeout blocks inside
+# that method
+#
+# Also changes how the read timeout behaves so that it is cumulative (closer
+# to HTTP::Timeout::Global, but still having distinct timeouts for other
+# operation types)
+class PerOperationWithDeadline < HTTP::Timeout::PerOperation
+  READ_DEADLINE = 30
+
+  def initialize(*args)
+    super
+
+    @read_deadline = options.fetch(:read_deadline, READ_DEADLINE)
+  end
+
+  def connect(socket_class, host, port, nodelay = false) # rubocop:disable Style/OptionalBooleanParameter
+    @socket = socket_class.open(host, port)
+    @socket.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1) if nodelay
+  end
+
+  # Reset deadline when the connection is re-used for different requests
+  def reset_counter
+    @deadline = nil
+  end
+
+  # Read data from the socket
+  def readpartial(size, buffer = nil)
+    @deadline ||= Process.clock_gettime(Process::CLOCK_MONOTONIC) + @read_deadline
+
+    timeout = false
+    loop do
+      result = @socket.read_nonblock(size, buffer, exception: false)
+
+      return :eof if result.nil?
+
+      remaining_time = @deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      raise HTTP::TimeoutError, "Read timed out after #{@read_timeout} seconds" if timeout
+      raise HTTP::TimeoutError, "Read timed out after a total of #{@read_deadline} seconds" if remaining_time <= 0
+      return result if result != :wait_readable
+
+      # marking the socket for timeout. Why is this not being raised immediately?
+      # it seems there is some race-condition on the network level between calling
+      # #read_nonblock and #wait_readable, in which #read_nonblock signalizes waiting
+      # for reads, and when waiting for x seconds, it returns nil suddenly without completing
+      # the x seconds. In a normal case this would be a timeout on wait/read, but it can
+      # also mean that the socket has been closed by the server. Therefore we "mark" the
+      # socket for timeout and try to read more bytes. If it returns :eof, it's all good, no
+      # timeout. Else, the first timeout was a proper timeout.
+      # This hack has to be done because io/wait#wait_readable doesn't provide a value for when
+      # the socket is closed by the server, and HTTP::Parser doesn't provide the limit for the chunks.
+      timeout = true unless @socket.to_io.wait_readable([remaining_time, @read_timeout].min)
+    end
+  end
+end
+
+# Implement HTTP Signature cavage draft as a HTTP.rb middleware
+class CavageSignatureFeature < HTTP::Feature
+  def initialize(keypair: nil, covered_headers: [])
+    super
+
+    @signing = HttpSignatureDraft.new(keypair.keypair, keypair.full_uri) if keypair.present?
+    @covered_headers = covered_headers
+  end
+
+  def wrap_request(request)
+    signed_headers = request.headers.to_h.slice(*@covered_headers)
+    request.headers['Signature'] = @signing.sign(signed_headers, request.verb, Addressable::URI.parse(request.uri))
+    request
+  end
+
+  # Register this feature with http.rb
+  ::HTTP::Options.register_feature(:http_cavage_signature, self)
+end
+
+class Request
+  # We enforce a 5s timeout on DNS resolving, 5s timeout on socket opening
+  # and 5s timeout on the TLS handshake, meaning the worst case should take
+  # about 15s in total
+  TIMEOUT = { connect_timeout: 5, read_timeout: 10, write_timeout: 10, read_deadline: 30 }.freeze
+  SAFE_PRESERVED_CHARS = '+,'
+
+  include RoutingHelper
+
+  attr_reader :headers, :signing_keypair
+
+  def initialize(verb, url, **options)
+    raise ArgumentError if url.blank?
+
+    @verb        = verb
+    @url         = normalize_preserving_url_encodings(url, SAFE_PRESERVED_CHARS)
+    @http_client = options.delete(:http_client)
+    @allow_local = options.delete(:allow_local)
+    @options     = {
+      follow: {
+        max_hops: 3,
+      },
+    }.merge(options).merge(
+      socket_class: use_proxy? || @allow_local ? ProxySocket : Socket,
+      timeout_class: PerOperationWithDeadline,
+      timeout_options: TIMEOUT
+    )
+    @options     = @options.merge(proxy_url) if use_proxy?
+    @headers     = {}
+
+    @signing_keypair = nil
+
+    raise Mastodon::HostValidationError, 'Instance does not support hidden service connections' if block_hidden_service?
+
+    set_common_headers!
+  end
+
+  def on_behalf_of(actor, sign_with: nil)
+    raise ArgumentError, 'actor must not be nil' if actor.nil?
+
+    @signing_keypair = sign_with.presence || actor.keypair(type: :rsa)
+
+    self
+  end
+
+  def add_headers(new_headers)
+    @headers.merge!(new_headers)
+    self
+  end
+
+  def perform
+    begin
+      # Try with HTTP Signatures (draft-cavage-http-signatures-12) first
+      response = perform_cavage_signed_request
+
+      # Then if it fails, double-knock using RFC 9421: HTTP Message Signatures
+      if @signing_keypair.present? && [400, 401].include?(response.code)
+        # Consume the body of the first response first
+        response.truncated_body if http_client.persistent? && !response.connection.finished_request?
+
+        response = perform_rfc9421_signed_request
+      end
+    rescue => e
+      raise e.class, "#{e.message} on #{@url}", e.backtrace[0]
+    end
+
+    begin
+      yield response if block_given?
+    ensure
+      response.truncated_body if http_client.persistent? && !response.connection.finished_request?
+      http_client.close unless http_client.persistent? && response.connection.finished_request?
+    end
+  end
+
+  class << self
+    def valid_url?(url)
+      begin
+        parsed_url = Addressable::URI.parse(url)
+      rescue Addressable::URI::InvalidURIError
+        return false
+      end
+
+      %w(http https).include?(parsed_url.scheme) && parsed_url.host.present?
+    end
+
+    def http_client
+      HTTP.use(:auto_inflate)
+    end
+  end
+
+  private
+
+  def perform_cavage_signed_request
+    headers = @headers
+    headers = headers.merge('Digest' => "SHA-256=#{Digest::SHA256.base64digest(@options[:body])}") if @options[:body]
+
+    client = http_client
+
+    if @signing_keypair.present?
+      client = client.use(
+        http_cavage_signature: {
+          keypair: @signing_keypair,
+          covered_headers: headers.keys - %w(User-Agent Accept-Encoding Accept),
+        }
+      )
+    end
+
+    client.request(@verb, @url.to_s, @options.merge(headers:))
+  end
+
+  def perform_rfc9421_signed_request
+    headers = @headers
+    headers = headers.merge('content-digest' => "sha-256=:#{OpenSSL::Digest.base64digest('sha256', @options[:body])}:") if @options[:body]
+
+    client = http_client
+
+    if @signing_keypair.present?
+      client = client.use(
+        http_signature: {
+          key: @signing_keypair.linzer_private_key,
+          covered_components: @options.key?(:body) ? %w(@method @target-uri content-digest) : %w(@method @target-uri),
+        }
+      )
+    end
+
+    client.request(@verb, @url.to_s, @options.merge(headers:))
+  end
+
+  # Using code from https://github.com/sporkmonger/addressable/blob/3450895887d0a1770660d8831d1b6fcfed9bd9d6/lib/addressable/uri.rb#L1609-L1635
+  # to preserve some URL Encodings while normalizing
+  def normalize_preserving_url_encodings(url, preserved_chars = SAFE_PRESERVED_CHARS, *flags)
+    original_uri = Addressable::URI.parse(url)
+    normalized_uri = original_uri.normalize
+
+    if original_uri.query
+      modified_query_class = Addressable::URI::CharacterClasses::QUERY.dup
+      modified_query_class.sub!('\\&', '').sub!('\\;', '')
+
+      pairs = original_uri.query.split('&', -1)
+      pairs.delete_if(&:empty?).uniq! if flags.include?(:compacted)
+      pairs.sort! if flags.include?(:sorted)
+
+      normalized_query = pairs.map do |pair|
+        Addressable::URI.normalize_component(
+          pair,
+          modified_query_class,
+          preserved_chars
+        )
+      end.join('&')
+
+      normalized_uri.query = normalized_query == '' ? nil : normalized_query
+    end
+
+    normalized_uri
+  end
+
+  def set_common_headers!
+    @headers['User-Agent']      = Mastodon::Version.user_agent
+    @headers['Host']            = @url.host
+    @headers['Date']            = Time.now.utc.httpdate
+    @headers['Accept-Encoding'] = 'gzip' if @verb != :head
+  end
+
+  def http_client
+    @http_client ||= Request.http_client
+  end
+
+  def use_proxy?
+    proxy_url.present?
+  end
+
+  def proxy_url
+    if hidden_service? && Rails.configuration.x.http_client_hidden_proxy.present?
+      Rails.configuration.x.http_client_hidden_proxy
+    else
+      Rails.configuration.x.http_client_proxy
+    end
+  end
+
+  def block_hidden_service?
+    !Rails.configuration.x.access_to_hidden_service && hidden_service?
+  end
+
+  def hidden_service?
+    /\.(onion|i2p)$/.match?(@url.host)
+  end
+
+  module ClientLimit
+    def truncated_body(limit = 1.megabyte)
+      if charset.nil?
+        encoding = Encoding::BINARY
+      else
+        begin
+          encoding = Encoding.find(charset)
+        rescue ArgumentError
+          encoding = Encoding::BINARY
+        end
+      end
+
+      contents = String.new(encoding: encoding)
+
+      while (chunk = readpartial)
+        contents << chunk
+        chunk.clear
+
+        break if contents.bytesize > limit
+      end
+
+      contents
+    end
+
+    def body_with_limit(limit = 1.megabyte)
+      require_limit_not_exceeded!(limit)
+
+      contents = truncated_body(limit)
+      raise Mastodon::LengthValidationError, "Body size exceeds limit of #{limit}" if contents.bytesize > limit
+
+      contents
+    end
+
+    def require_limit_not_exceeded!(limit)
+      raise Mastodon::LengthValidationError, "Content-Length #{content_length} exceeds limit of #{limit}" if content_length.present? && content_length > limit
+    end
+  end
+
+  if ::HTTP::Response.methods.include?(:body_with_limit) && !Rails.env.production?
+    raise 'HTTP::Response#body_with_limit is already defined, the monkey patch will not be applied'
+  else
+    class ::HTTP::Response
+      include Request::ClientLimit
+    end
+  end
+
+  class Socket < TCPSocket
+    class << self
+      def open(host, *args)
+        outer_e = nil
+        port    = args.first
+
+        addresses = []
+        begin
+          addresses = [IPAddr.new(host).to_s]
+        rescue IPAddr::InvalidAddressError
+          resolvers = [Resolv::Hosts.new, Resolv::DNS.new.tap { |dns| dns.timeouts = 5 }]
+          addresses = Resolv.new(resolvers).getaddresses(host)
+          addresses = addresses.grep(Resolv::IPv6::Regex).take(2) + addresses.grep_v(Resolv::IPv6::Regex).take(2)
+        end
+
+        socks = []
+        addr_by_socket = {}
+
+        addresses.each do |address|
+          check_private_address(address, host)
+
+          sock     = ::Socket.new(address.match?(Resolv::IPv6::Regex) ? ::Socket::AF_INET6 : ::Socket::AF_INET, ::Socket::SOCK_STREAM, 0)
+          sockaddr = ::Socket.pack_sockaddr_in(port, address.to_s)
+
+          sock.setsockopt(::Socket::IPPROTO_TCP, ::Socket::TCP_NODELAY, 1)
+
+          sock.connect_nonblock(sockaddr)
+
+          # If that hasn't raised an exception, we somehow managed to connect
+          # immediately, close pending sockets and return immediately
+          socks.each(&:close)
+          return sock
+        rescue IO::WaitWritable
+          socks << sock
+          addr_by_socket[sock] = sockaddr
+        rescue => e
+          outer_e = e
+        end
+
+        until socks.empty?
+          _, available_socks, = IO.select(nil, socks, nil, Request::TIMEOUT[:connect_timeout])
+
+          if available_socks.nil?
+            socks.each(&:close)
+            raise HTTP::TimeoutError, "Connect timed out after #{Request::TIMEOUT[:connect_timeout]} seconds"
+          end
+
+          available_socks.each do |sock|
+            socks.delete(sock)
+
+            begin
+              sock.connect_nonblock(addr_by_socket[sock])
+            rescue Errno::EISCONN
+              # Do nothing
+            rescue => e
+              sock.close
+              outer_e = e
+              next
+            end
+
+            socks.each(&:close)
+            return sock
+          end
+        end
+
+        if outer_e
+          raise outer_e
+        else
+          raise SocketError, "No address for #{host}"
+        end
+      end
+
+      alias new open
+
+      def check_private_address(address, host)
+        addr = IPAddr.new(address.to_s)
+
+        return if Rails.env.development? || Rails.configuration.x.private_address_exceptions.any? { |range| range.include?(addr) }
+
+        raise Mastodon::PrivateNetworkAddressError, host if PrivateAddressCheck.private_address?(addr)
+      end
+    end
+  end
+
+  class ProxySocket < Socket
+    class << self
+      def check_private_address(_address, _host)
+        # Accept connections to private addresses as HTTP proxies will usually
+        # be on local addresses
+        nil
+      end
+    end
+  end
+
+  private_constant :ClientLimit
+end
