@@ -1,0 +1,69 @@
+# frozen_string_literal: true
+
+class ActivityPub::LinkedDataSignature
+  include JsonLdHelper
+
+  CONTEXT = 'https://w3id.org/identity/v1'
+
+  def initialize(json)
+    @json = json.with_indifferent_access
+  end
+
+  def verify_actor!
+    return unless @json['signature'].is_a?(Hash)
+    return if unsupported_jsonld_features?(@json)
+
+    signature_options = compact(@json['signature'].merge({ '@context' => CONTEXT }), CONTEXT)
+
+    type        = signature_options['type']
+    creator_uri = signature_options['creator']
+    signature   = signature_options['signatureValue']
+
+    return if signature_options['expires']&.to_datetime&.past?
+
+    return unless type == 'RsaSignature2017'
+
+    keypair = Keypair.from_keyid(creator_uri)
+    keypair = ActivityPub::FetchRemoteKeyService.new.call(creator_uri) if keypair&.public_key.blank?
+    return if keypair.nil? || !keypair.usable? || keypair.type != 'rsa'
+
+    options_hash   = hash(signature_options.without('type', 'id', 'signatureValue'))
+    document_hash  = hash(@json.without('signature'))
+    to_be_verified = options_hash + document_hash
+
+    keypair.actor if keypair.keypair.public_key.verify(OpenSSL::Digest.new('SHA256'), Base64.decode64(signature), to_be_verified)
+  rescue OpenSSL::PKey::PKeyError
+    false
+  end
+
+  def sign!(creator, sign_with: nil, expires_in: 2.days)
+    keypair = sign_with.presence || creator.keypair(type: :rsa)
+
+    options = {
+      'type' => 'RsaSignature2017',
+      'creator' => keypair.full_uri,
+      'created' => Time.now.utc.iso8601,
+      'expires' => expires_in.from_now.utc.iso8601,
+    }
+
+    options_hash  = hash(options.without('type', 'id', 'signatureValue').merge('@context' => CONTEXT))
+    document_hash = hash(@json.without('signature'))
+    to_be_signed  = options_hash + document_hash
+
+    signature = Base64.strict_encode64(keypair.keypair.sign(OpenSSL::Digest.new('SHA256'), to_be_signed))
+
+    # Mastodon's context is either an array or a single URL
+    context_with_security = Array(@json['@context'])
+    context_with_security << 'https://w3id.org/security/v1'
+    context_with_security.uniq!
+    context_with_security = context_with_security.first if context_with_security.size == 1
+
+    @json.merge('signature' => options.merge('signatureValue' => signature), '@context' => context_with_security)
+  end
+
+  private
+
+  def hash(obj)
+    Digest::SHA256.hexdigest(canonicalize(obj))
+  end
+end

@@ -1,0 +1,36 @@
+- content_for :page_title do
+  = t('deletes.title', acct: current_account.local_username_and_domain)
+
+= simple_form_for @confirmation, url: settings_delete_path, method: :delete do |f|
+  %p.hint= t('deletes.warning.before')
+
+  %ul.hint
+    - if current_user.confirmed? && current_user.approved?
+      %li.warning-hint= t('deletes.warning.irreversible')
+      %li.warning-hint= t('deletes.warning.username_unavailable')
+      %li.warning-hint= t('deletes.warning.data_removal')
+      %li.warning-hint= t('deletes.warning.caches')
+    - else
+      %li.positive-hint= t('deletes.warning.email_change_html', path: edit_user_registration_path)
+      %li.positive-hint= t('deletes.warning.email_reconfirmation_html', path: new_user_confirmation_path)
+      %li.positive-hint= t('deletes.warning.email_contact_html', email: Setting.site_contact_email)
+      %li.positive-hint= t('deletes.warning.username_available')
+
+  %p.hint= t('deletes.warning.more_details_html', terms_path: privacy_policy_path)
+
+  %hr.spacer/
+
+  = f.input :username,
+            wrapper: :with_block_label,
+            input_html: { autocomplete: 'off' },
+            label: t('deletes.confirm_username'),
+            hint: t('deletes.confirm_username_hint_html', username: current_account.username)
+
+  - if current_user.encrypted_password.present?
+    = f.input :password,
+              wrapper: :with_block_label,
+              input_html: { autocomplete: 'current-password' },
+              hint: t('deletes.confirm_password')
+
+  .actions
+    = f.button :button, t('deletes.proceed'), type: :submit, class: 'negative'
