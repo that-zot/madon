@@ -1,0 +1,200 @@
+---
+fi:
+  activerecord:
+    attributes:
+      doorkeeper/application:
+        name: Sovelluksen nimi
+        redirect_uri: Uudelleenohjaus-URI
+        scopes: Oikeudet
+        website: Sovelluksen verkkosivusto
+    errors:
+      models:
+        doorkeeper/application:
+          attributes:
+            redirect_uri:
+              fragment_present: ei voi sisältää ankkuria (#).
+              invalid_uri: on oltava kelvollinen URI.
+              relative_uri: on oltava täysi URI.
+              secured_uri: on oltava HTTPS-/SSL-URI.
+  doorkeeper:
+    applications:
+      buttons:
+        authorize: Valtuuta
+        cancel: Peruuta
+        destroy: Poista
+        edit: Muokkaa
+        submit: Lähetä
+      confirmations:
+        destroy: Oletko varma?
+      edit:
+        title: Muokkaa sovellusta
+      form:
+        error: Hupsis! Tarkista, ettei lomakkeessasi ole virheitä
+      help:
+        native_redirect_uri: Käytä tunnistetta %{native_redirect_uri} paikallisiin testeihin
+        redirect_uri: Lisää jokainen URI omalle rivilleen
+        scopes: Erota oikeudet välilyönneillä. Jätä kenttä tyhjäksi, jos haluat käyttää oletusoikeuksia.
+      index:
+        application: Sovellus
+        callback_url: Takaisinkutsu-URL
+        delete: Poista
+        empty: Sinulla ei ole sovelluksia.
+        name: Nimi
+        new: Uusi sovellus
+        scopes: Oikeudet
+        show: Näytä
+        title: Omat sovellukset
+      new:
+        title: Uusi sovellus
+      show:
+        actions: Toiminnot
+        application_id: Asiakasohjelman tunnus
+        callback_urls: Takaisinkutsu-URL:t
+        scopes: Oikeudet
+        secret: Asiakasohjelman salaisuus
+        title: 'Sovellus: %{name}'
+    authorizations:
+      buttons:
+        authorize: Valtuuta
+        deny: Epää
+      error:
+        title: Tapahtui virhe
+      new:
+        prompt_html: "%{client_name} haluaisi käyttöoikeuden tiliisi. <strong>Hyväksy tämä pyyntö vain, jos tunnistat lähteen ja luotat siihen.</strong>"
+        review_permissions: Tarkista käyttöoikeudet
+        title: Valtuutus vaaditaan
+      show:
+        title: Kopioi tämä valtuutuskoodi ja liitä se sovellukseen.
+    authorized_applications:
+      buttons:
+        revoke: Poista
+      confirmations:
+        revoke: Oletko varma?
+      index:
+        authorized_at: Valtuutettu %{date}
+        description_html: Nämä sovellukset voivat käyttää tiliäsi ohjelmointirajapinnan kautta. Jos tässä on sovelluksia, joita et tunnista, tai sovellus toimii väärin, voit peruuttaa sen käyttöoikeuden.
+        last_used_at: Käytetty viimeksi %{date}
+        never_used: Ei käytetty
+        scopes: Käyttöoikeudet
+        superapp: Sisäinen
+        title: Valtuuttamasi sovellukset
+    errors:
+      messages:
+        access_denied: Resurssin omistaja tai valtuutuspalvelin hylkäsi pyynnön.
+        credential_flow_not_configured: Resurssin omistajan salasanatietojen luku epäonnistui, koska asetusta Doorkeeper.configure.resource_owner_from_credentials ei ole konfiguroitu.
+        invalid_client: Asiakasohjelman todennus epäonnistui, koska asiakas on tuntematon, asiakkaan todennus ei ollut mukana tai todennustapaa ei tueta.
+        invalid_code_challenge_method:
+          one: Muuttujan code_challenge_method arvon on oltava %{challenge_methods}.
+          other: 'Muuttujan code_challenge_method arvon on oltava jokin seuraavista: %{challenge_methods}.'
+        invalid_grant: Valtuutuslupa on virheellinen, vanhentunut, peruttu, valtuutuspyynnössä käytettyä uudelleenohjaus-URI:tä vastaamaton tai myönnetty toiselle asiakkaalle.
+        invalid_redirect_uri: Uudelleenohjaus-URI on virheellinen.
+        invalid_request:
+          missing_param: 'Vaadittu parametri puuttuu: %{value}.'
+          request_not_authorized: Pyyntö on valtuutettava. Vaadittu parametri pyynnön valtuuttamiseksi puuttuu tai on virheellinen.
+          unknown: Pyynnöstä puuttuu vaadittu parametri, se sisältää tukemattoman parametriarvon tai on muulla tavoin väärin muotoiltu.
+        invalid_resource_owner: Annetut resurssin omistajan tunnnukset ovat virheelliset, tai resurssin omistajaa ei löydy
+        invalid_scope: Pyydetyt oikeudet ovat virheellisiä, tuntemattomia tai väärin muotoiltuja.
+        invalid_token:
+          expired: Käyttöoikeustunnus on vanhentunut
+          revoked: Käyttöoikeustunnus on peruttu
+          unknown: Käyttöoikeustunnus on virheellinen
+        resource_owner_authenticator_not_configured: Resurssin omistajaa ei löytynyt, koska asetusta Doorkeeper.configure.resource_owner_authenticator ei ole konfiguroitu.
+        server_error: Valtuutuspalvelin kohtasi odottamattoman virheen, joka esti pyynnön täyttämisen.
+        temporarily_unavailable: Valtuutuspalvelin ei voi tällä hetkellä käsitellä pyyntöä joko väliaikaisen ruuhkan tai huollon takia.
+        unauthorized_client: Asiakkaalla ei ole valtuuksia tehdä tätä pyyntöä tällä metodilla.
+        unsupported_grant_type: Valtuutuspalvelin ei tue tätä valtuutusluvan tyyppiä.
+        unsupported_response_type: Valtuutuspalvelin ei tue tätä vastauksen tyyppiä.
+    flash:
+      applications:
+        create:
+          notice: Sovellus luotu.
+        destroy:
+          notice: Sovellus poistettu.
+        update:
+          notice: Sovellus päivitetty.
+      authorized_applications:
+        destroy:
+          notice: Sovellus poistettu.
+    grouped_scopes:
+      access:
+        read: Vain lukuoikeus
+        read/write: Luku- ja kirjoitusoikeudet
+        write: Vain kirjoitusoikeus
+      title:
+        accounts: Tilit
+        admin/accounts: Tilien hallinnointi
+        admin/all: Kaikki hallinnolliset toiminnot
+        admin/reports: Raporttien hallinnointi
+        all: Täysi pääsy Mastodon-tiliisi
+        blocks: Estot
+        bookmarks: Kirjanmerkit
+        conversations: Keskustelut
+        crypto: Päästä päähän -⁠salaus
+        favourites: Suosikit
+        filters: Suodattimet
+        follow: Seurattavat, mykistykset ja estot
+        follows: Seurattavat
+        lists: Listat
+        media: Medialiitteet
+        mutes: Mykistykset
+        notifications: Ilmoitukset
+        profile: Mastodon-profiilisi
+        push: Puskuilmoitukset
+        reports: Raportit
+        search: Haku
+        statuses: Julkaisut
+    layouts:
+      admin:
+        nav:
+          applications: Sovellukset
+          oauth2_provider: OAuth2-palveluntarjoaja
+      application:
+        title: OAuth-valtuutus tarvitaan
+    scopes:
+      admin:read: lue kaikkia palvelimen tietoja
+      admin:read:accounts: lue arkaluonteisia tietoja kaikista tileistä
+      admin:read:canonical_email_blocks: lue arkaluonteisia tietoja kaikista estetyistä kanonisista sähköpostiosoitteista
+      admin:read:domain_allows: lue arkaluonteisia tietoja kaikista sallituista verkkotunnuksista
+      admin:read:domain_blocks: lue arkaluonteisia tietoja kaikista estetyistä verkkotunnuksista
+      admin:read:email_domain_blocks: lue arkaluonteisia tietoja kaikista estetyistä sähköpostiverkkotunnuksista
+      admin:read:ip_blocks: lue arkaluonteisia tietoja kaikista estetyistä IP-osoitteista
+      admin:read:reports: lue arkaluonteisia tietoja kaikista raporteista ja raportoiduista tileistä
+      admin:write: muokkaa kaikkia palvelimen tietoja
+      admin:write:accounts: suorita moderointitoimia tileille
+      admin:write:canonical_email_blocks: suorita moderointitoimia estetyille kanonisille sähköpostiosoitteille
+      admin:write:domain_allows: suorita moderointitoimia sallituille verkkotunnuksille
+      admin:write:domain_blocks: suorita moderointitoimia estetyille verkkotunnuksille
+      admin:write:email_domain_blocks: suorita moderointitoimia estetyille sähköpostiverkkotunnuksille
+      admin:write:ip_blocks: suorita moderointitoimia estetyille IP-osoitteille
+      admin:write:reports: suorita moderointitoimia raporteille
+      crypto: käytä päästä päähän -⁠salausta
+      follow: muokkaa tilin seurantasuhteita
+      profile: lue vain tilisi profiilitietoja
+      push: vastaanota puskuilmoituksesi
+      read: lue kaikkia tilisi tietoja
+      read:accounts: katso tilien tietoja
+      read:blocks: katso estojasi
+      read:bookmarks: katso kirjanmerkkejäsi
+      read:favourites: katso suosikkejasi
+      read:filters: katso suodattimiasi
+      read:follows: katso seurattaviasi
+      read:lists: katso listojasi
+      read:mutes: katso mykistyksiäsi
+      read:notifications: katso ilmoituksiasi
+      read:reports: katso raporttejasi
+      read:search: hae puolestasi
+      read:statuses: katso kaikkia julkaisujasi
+      write: muokkaa kaikkia tilisi tietoja
+      write:accounts: muokkaa profiiliasi
+      write:blocks: estä tilejä ja verkkotunnuksia
+      write:bookmarks: lisää julkaisuja kirjanmerkkeihin
+      write:conversations: mykistä ja poista keskusteluja
+      write:favourites: lisää julkaisuja suosikkeihin
+      write:filters: luo suodattimia
+      write:follows: seuraa käyttäjiä
+      write:lists: luo listoja
+      write:media: lähetä mediatiedostoja
+      write:mutes: mykistä käyttäjiä ja keskusteluja
+      write:notifications: tyhjennä ilmoituksesi
+      write:reports: raportoi muita käyttäjiä
+      write:statuses: julkaise julkaisuja
