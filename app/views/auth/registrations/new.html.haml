@@ -10,6 +10,18 @@
   %h1.title= t('auth.sign_up.title', domain: site_hostname)
   %p.lead= t('auth.sign_up.preamble')
 
+  -# madon: frame the instance as a verified community at sign-up; full
+  -# explainer lives on /about (Setting.site_extended_description). Opens in a
+  -# new tab so it never interrupts the handle-pick flow. Bilingual inline to
+  -# avoid patching Mastodon locale files; FORCE_DEFAULT_LOCALE=he ⇒ default :he.
+  %p.hint.madon-verified-note
+    - if I18n.locale == :he
+      כאן כל חבר הוא אדם אמיתי ומאומת אחד — ולכן הספירות אמיתיות.
+      = link_to 'מידע נוסף', about_path, target: '_blank', rel: 'noopener'
+    - else
+      Here, every member is one real, verified person — so the numbers are real.
+      = link_to 'Learn more', about_path, target: '_blank', rel: 'noopener'
+
   = render 'shared/error_messages', object: resource
 
   - if @invite.present? && @invite.autofollow?
@@ -24,21 +36,22 @@
                  input_html: { autocomplete: 'off', pattern: '[a-zA-Z0-9_]+', maxlength: Account::USERNAME_LENGTH_LIMIT },
                  required: true,
                  wrapper: :with_label
-    = f.input :email,
-              hint: false,
-              input_html: { autocomplete: 'username' },
-              required: true,
-              wrapper: :with_label
-    = f.input :password,
-              hint: false,
-              input_html: { autocomplete: 'new-password', minlength: User.password_length.first, maxlength: User.password_length.last },
-              required: true,
-              wrapper: :with_label
-    = f.input :password_confirmation,
-              hint: false,
-              input_html: { 'aria-label': t('simple_form.labels.defaults.confirm_password'), autocomplete: 'new-password', maxlength: User.password_length.last },
-              placeholder: t('simple_form.labels.defaults.confirm_password'),
-              required: true
+    - unless resource.external?
+      = f.input :email,
+                hint: false,
+                input_html: { autocomplete: 'username' },
+                required: true,
+                wrapper: :with_label
+      = f.input :password,
+                hint: false,
+                input_html: { autocomplete: 'new-password', minlength: User.password_length.first, maxlength: User.password_length.last },
+                required: true,
+                wrapper: :with_label
+      = f.input :password_confirmation,
+                hint: false,
+                input_html: { 'aria-label': t('simple_form.labels.defaults.confirm_password'), autocomplete: 'new-password', maxlength: User.password_length.last },
+                placeholder: t('simple_form.labels.defaults.confirm_password'),
+                required: true
     = f.input :confirm_password,
               as: :string,
               hint: false,
@@ -81,4 +94,4 @@
               wrapper: :with_label
 
   .actions
-    = f.button :button, @invite&.bypass_approval? ? t('auth.register') : sign_up_message, type: :submit
+    = f.button :button, (@invite&.bypass_approval? || resource.external?) ? t('auth.register') : sign_up_message, type: :submit
